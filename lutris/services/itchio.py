@@ -111,6 +111,7 @@ class ItchIoService(OnlineService):
     cache_path = os.path.join(settings.CACHE_DIR, "itchio/api/")
 
     key_cache_file = os.path.join(cache_path, "profile/owned-keys.json")
+    collection_cache_file = os.path.join(cache_path, "profile/collection.json")
     games_cache_path = os.path.join(cache_path, "games/")
     key_cache = {}
 
@@ -182,6 +183,18 @@ class ItchIoService(OnlineService):
     def fetch_owned_keys(self, query=None):
         """Do API request to get games owned by user (paginated)"""
         return self.make_api_request("profile/owned-keys", query)
+
+    def fetch_collections(self, query=None):
+        """Do API request to users collections"""
+        return self.make_api_request("profile/collections", query)
+
+    def fetch_collection(self, collection_id):
+        """Do API request to get info about a collection"""
+        return self.make_api_request(f"collections/{collection_id}")
+
+    def fetch_collection_games(self, collection_id, query=None):
+        """Do API request to get the list of games in a collection"""
+        return self.make_api_request(f"collections/{collection_id}/collection-games", query)
 
     def fetch_game(self, game_id):
         """Do API request to get game info"""
@@ -268,9 +281,61 @@ class ItchIoService(OnlineService):
             self._cache_games(games)
         return games
 
+    def get_collected_games(self, force_load=False):
+        """Get some games from a users collection"""
+        collection = {}
+        fresh_data = True
+
+        if (not force_load) and os.path.exists(self.collection_cache_file):
+            with open(self.collection_cache_file, "r", encoding="utf-8") as key_file:
+                collection = json.load(key_file)
+            fresh_data = False
+        else:
+            # get all collections
+            collections = self.fetch_collections().get("collections", [])
+
+            # if there is only one collection we use that one
+            # if there is more than one collection we use the first collection titled "lutris"
+            if len(collections) == 1:
+                collection = collections[0]
+            elif len(collections) > 1:
+                lutris_collections = list(filter(lambda col: col.get("title", "") == "lutris", collections))
+                if len(lutris_collections) > 0:
+                    collection = lutris_collections[0]
+
+            # if we found a suitable collection get the list of games in that collection
+            if collection != {} and "id" in collection:
+                collection["games"] = []
+                query = {"page": 1}
+                # Basic security; I'm pretty sure itch.io will block us before that tho
+                safety = 65507
+                while safety:
+                    response = self.fetch_collection_games(collection["id"], query)
+                    if isinstance(response["collection_games"], list):
+                        collection["games"] += response["collection_games"]
+                        if len(response["collection_games"]) == int(response["per_page"]):
+                            query["page"] += 1
+                        else:
+                            break
+                    else:
+                        break
+                    safety -= 1
+
+            # cache the resulting collection
+            os.makedirs(os.path.join(self.cache_path, "profile/"), exist_ok=True)
+            with open(self.collection_cache_file, "w", encoding="utf-8") as key_file:
+                json.dump(collection, key_file)
+
+        games = list(
+            filter(lambda game: game != None, [col_game.get("game") for col_game in collection.get("games", [])])
+        )
+        if fresh_data:
+            self._cache_games(games)
+        return games
+
     def get_games(self):
         """Return games from the user's library"""
-        games = self.get_owned_games()
+        games = self.get_owned_games() + self.get_collected_games()
         filtered_games = []
         for game in games:
             traits = game.get("traits", {})
