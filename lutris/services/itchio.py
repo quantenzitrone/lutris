@@ -111,8 +111,9 @@ class ItchIoService(OnlineService):
     cache_path = os.path.join(settings.CACHE_DIR, "itchio/api/")
 
     key_cache_file = os.path.join(cache_path, "profile/owned-keys.json")
-    collection_cache_file = os.path.join(cache_path, "profile/collection.json")
+    collection_list_cache_file = os.path.join(cache_path, "profile/collections.json")
     games_cache_path = os.path.join(cache_path, "games/")
+    collection_cache_path = os.path.join(cache_path, "collections/")
     key_cache = {}
 
     supported_platforms = ("p_linux", "p_windows")
@@ -281,30 +282,37 @@ class ItchIoService(OnlineService):
             self._cache_games(games)
         return games
 
-    def get_collected_games(self, force_load=False):
-        """Get some games from a users collection"""
-        collection = {}
-        fresh_data = True
+    def get_collection_cache(self, collection_id):
+        """Create basic cache key based on collection slug and collection_id"""
+        return os.path.join(self.collection_cache_path, f"{collection_id}.json")
 
-        if (not force_load) and os.path.exists(self.collection_cache_file):
-            with open(self.collection_cache_file, "r", encoding="utf-8") as key_file:
-                collection = json.load(key_file)
-            fresh_data = False
-        else:
-            # get all collections
-            collections = self.fetch_collections().get("collections", [])
+    def _cache_collection(self, collection):
+        """Store information about collections in cache"""
+        os.makedirs(self.collection_cache_path, exist_ok=True)
+        filename = self.get_collection_cache(collection["id"])
+        key_path = os.path.join(self.collection_cache_path, filename)
+        with open(key_path, "w", encoding="utf-8") as cache_file:
+            json.dump(collection, cache_file)
 
-            # if there is only one collection we use that one
-            # if there is more than one collection we use the first collection titled "lutris"
-            if len(collections) == 1:
-                collection = collections[0]
-            elif len(collections) > 1:
-                lutris_collections = list(filter(lambda col: col.get("title", "") == "lutris", collections))
-                if len(lutris_collections) > 0:
-                    collection = lutris_collections[0]
+    def get_games_in_collections(self, collection_list: list, force_load=False):
+        """Get all games from a list of collections"""
 
-            # if we found a suitable collection get the list of games in that collection
-            if collection != {} and "id" in collection:
+        games = []
+
+        known_appids = set()
+
+        # fetch collected games for each collection
+        for collection in collection_list:
+            fresh_data = True
+
+            collection_cache_path = self.get_collection_cache(collection["id"])
+
+            if (not force_load) and os.path.exists(collection_cache_path):
+                with open(collection_cache_path, "r", encoding="utf-8") as key_file:
+                    collection = json.load(key_file)
+                fresh_data = False
+            else:
+                # get the list of games in that collection
                 collection["games"] = []
                 query = {"page": 1}
                 # Basic security; I'm pretty sure itch.io will block us before that tho
@@ -321,21 +329,71 @@ class ItchIoService(OnlineService):
                         break
                     safety -= 1
 
-            # cache the resulting collection
-            os.makedirs(os.path.join(self.cache_path, "profile/"), exist_ok=True)
-            with open(self.collection_cache_file, "w", encoding="utf-8") as key_file:
-                json.dump(collection, key_file)
+                # filter out bad data for safety
+                collection["games"] = list(
+                    filter(lambda col_game: "game" in col_game and "id" in col_game["game"], collection["games"])
+                )
 
-        games = list(
-            filter(lambda game: game != None, [col_game.get("game") for col_game in collection.get("games", [])])
-        )
-        if fresh_data:
-            self._cache_games(games)
+                # try to get download keys from cache
+                for col_game in collection["games"]:
+                    game = col_game["game"]
+                    game_cache_path = self.get_game_cache(game["id"])
+                    if (
+                        "can_be_bought" in game.get("traits", [])
+                        and game.get("min_price", 0) > 0
+                        and os.path.exists(game_cache_path)
+                    ):
+                        with open(game_cache_path, "r", encoding="utf-8") as key_file:
+                            cached_game = json.load(key_file)
+                            if "download_key_id" in cached_game:
+                                game["download_key_id"] = cached_game["download_key_id"]
+
+                # cache the resulting collection
+                self._cache_collection(collection)
+
+            if fresh_data:
+                self._cache_games([col_game["game"] for col_game in collection["games"]])
+
+            for col_game in collection["games"]:
+                game = col_game["game"]
+                if game["id"] not in known_appids:
+                    known_appids.add(game["id"])
+                    games.append(game)
         return games
+
+    def get_collection_list(self, force_load=False):
+        collections = []
+        if (not force_load) and os.path.exists(self.collection_list_cache_file):
+            with open(self.collection_list_cache_file, "r", encoding="utf-8") as key_file:
+                collections = json.load(key_file)
+        else:
+            collections = self.fetch_collections().get("collections", [])
+            with open(self.collection_list_cache_file, "w", encoding="utf-8") as key_file:
+                json.dump(collections, key_file)
+        return collections
 
     def get_games(self):
         """Return games from the user's library"""
-        games = self.get_owned_games() + self.get_collected_games()
+        # get and cache owned games
+        owned_games = self.get_owned_games()
+
+        # get all collections
+        collections = self.get_collection_list()
+
+        # if there is only one collecion, use owned games and this collection
+        if len(collections) == 1:
+            games = owned_games + self.get_games_in_collections(collections)
+        else:
+            # if there are collections titled "lutris" (case insestitive) we use only these
+            lutris_collections = list(
+                filter(lambda col: col.get("title", "").lower() == "lutris" and "id" in col, collections)
+            )
+            if len(lutris_collections) > 0:
+                games = self.get_games_in_collections(lutris_collections)
+            # otherwise we just use all owned games
+            else:
+                games = self.get_owned_games()
+
         filtered_games = []
         for game in games:
             traits = game.get("traits", {})

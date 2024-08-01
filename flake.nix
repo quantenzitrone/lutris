@@ -37,6 +37,10 @@
           psmisc
           fluidsynth
         ];
+        packages = with pkgs; [
+            ruff
+            mypy
+        ];
         shellHook = ''
           export LD_LIBRARY_PATH='${lib.makeLibraryPath (with pkgs; [ file ])}';
         '';
